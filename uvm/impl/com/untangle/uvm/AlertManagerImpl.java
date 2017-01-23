@@ -1,885 +1,564 @@
 /**
- * $Id$
+ * $Id: ReportsManagerImpl.java,v 1.00 2015/03/04 13:59:12 dmorris Exp $
  */
 package com.untangle.uvm;
 
+import com.untangle.uvm.logging.LogEvent;
+import com.untangle.uvm.alert.AlertSettings;
+import com.untangle.uvm.alert.AlertRule;
+import com.untangle.uvm.alert.AlertRuleCondition;
+import com.untangle.uvm.alert.AlertRuleConditionField;
+import com.untangle.uvm.node.Node;
+import com.untangle.uvm.node.NodeSettings;
+import com.untangle.uvm.UvmContextFactory;
+
 import java.util.LinkedList;
+import java.util.Iterator;
 import java.util.List;
-import java.util.Date;
-import java.util.Map;
-import java.util.HashSet;
-import java.util.HashMap;
-import java.net.InetAddress;
-import java.net.Socket;
-import java.net.InetSocketAddress;
-import java.io.File;
-import java.lang.reflect.Method;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import org.apache.log4j.Logger;
 
-import com.untangle.uvm.UvmContextFactory;
-import com.untangle.uvm.AlertManager;
-import com.untangle.uvm.ExecManager;
-import com.untangle.uvm.util.I18nUtil;
-import com.untangle.uvm.node.Node;
-import com.untangle.uvm.node.NodeSettings;
-import com.untangle.uvm.node.PolicyManager;
-import com.untangle.uvm.node.Reporting;
-import com.untangle.uvm.network.NetworkSettings;
-import com.untangle.uvm.network.InterfaceSettings;
-import com.untangle.uvm.network.StaticRoute;
-
-import org.xbill.DNS.Lookup;
-import org.xbill.DNS.Record;
-import org.xbill.DNS.TXTRecord;
-import org.xbill.DNS.ARecord;
-import org.xbill.DNS.Type;
-import org.xbill.DNS.SimpleResolver;
-
-/**
- * Implements AlertManager. This class runs a series of test and creates alerts
- * for important things the administrator should know about. The UI displays these
- * alerts when the admin logs into the UI.
- *
- * Possible future alerts to add:
- * recent high load?
- * frequent reboots?
- * semi-frequent power loss?
- * disk almost full?
- * modified sources.list?
- */
 public class AlertManagerImpl implements AlertManager
 {
-    private final Logger logger = Logger.getLogger(this.getClass());
 
-    private I18nUtil i18nUtil;
+    private static final Logger logger = Logger.getLogger(AlertManagerImpl.class);
 
-    private ExecManager execManager = null;
+    private static AlertManagerImpl instance = null;
 
-    public AlertManagerImpl()
+    private final String settingsFilename = System.getProperty("uvm.settings.dir") + "/untangle-vm/" + "alert.js";
+
+    private AlertEventWriter eventWriter = new AlertEventWriter();
+
+    private int currentSettingsVersion = 4;
+
+    /**
+     * The current alert settings
+     */
+    private AlertSettings settings;
+
+    protected AlertManagerImpl()
     {
-        Map<String,String> i18nMap = UvmContextFactory.context().languageManager().getTranslations("untangle");
-        this.i18nUtil = new I18nUtil(i18nMap);
-    }
+        SettingsManager settingsManager = UvmContextFactory.context().settingsManager();
+        AlertSettings readSettings = null;
 
-    public synchronized List<String> getAlerts()
-    {
-        LinkedList<String> alertList = new LinkedList<String>();
-        boolean dnsWorking = false;
-
-        this.execManager = UvmContextFactory.context().createExecManager();
-
-        try { testUpgrades(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { dnsWorking = testDNS(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { if (dnsWorking) testConnectivity(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { if (dnsWorking) testConnector(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testDiskFree(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testDiskErrors(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testDupeApps(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testRendundantApps(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testBridgeBackwards(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testInterfaceErrors(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testSpamDNSServers(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testZveloDNSServers(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testEventWriteTime(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testEventWriteDelay(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testShieldEnabled(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testRoutesToReachableAddresses(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testServerConf(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
-        try { testLicenseCompliance(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
+        try {
+            readSettings = settingsManager.load( AlertSettings.class, this.settingsFilename );
+        } catch ( SettingsManager.SettingsException e ) {
+            logger.warn( "Failed to load settings:", e );
+        }
 
         /**
-         * Disabled Tests
+         * If there are still no settings, just initialize
          */
-        //try { testQueueFullMessages(alertList); } catch (Exception e) { logger.warn("Alert test exception",e); }
+        if (readSettings == null) {
+            logger.warn( "No settings found - Initializing new settings." );
+            this.setSettings( defaultSettings() );
+        }
+        else {
+            this.settings = readSettings;
 
-        this.execManager.close();
-        this.execManager = null;
+            logger.debug( "Loading Settings: " + this.settings.toJSONString() );
+        }
 
-        return alertList;
+        eventWriter.start();
     }
 
-    /**
-     * This test tests to see if upgrades are available
-     */
-    private void testUpgrades(List<String> alertList)
-    {
-        try {
-            if (UvmContextFactory.context().systemManager().upgradesAvailable(false)) {
-                alertList.add(i18nUtil.tr("Upgrades are available and ready to be installed."));
-            }
-        } catch (Exception e) {}
-    }
-
-    /**
-     * This test iterates through the DNS settings on each WAN and tests them individually
-     * It creates an alert for each non-working DNS server
-     */
-    private boolean testDNS(List<String> alertList)
-    {
-        ConnectivityTesterImpl connectivityTester = (ConnectivityTesterImpl)UvmContextFactory.context().getConnectivityTester();
-        List<InetAddress> nonWorkingDns = new LinkedList<InetAddress>();
-
-        for ( InterfaceSettings intf : UvmContextFactory.context().networkManager().getEnabledInterfaces() ) {
-            if (!intf.getIsWan())
-                continue;
-
-            InetAddress dnsPrimary   = UvmContextFactory.context().networkManager().getInterfaceStatus( intf.getInterfaceId() ).getV4Dns1();
-            InetAddress dnsSecondary = UvmContextFactory.context().networkManager().getInterfaceStatus( intf.getInterfaceId() ).getV4Dns2();
-
-            if (dnsPrimary != null)
-                if (!connectivityTester.isDnsWorking(dnsPrimary, null))
-                    nonWorkingDns.add(dnsPrimary);
-            if (dnsSecondary != null)
-                if (!connectivityTester.isDnsWorking(dnsSecondary, null))
-                    nonWorkingDns.add(dnsSecondary);
-        }
-
-        if (nonWorkingDns.size() > 0) {
-            String alertText = i18nUtil.tr("DNS connectivity failed:") + " ";
-            for (InetAddress ia : nonWorkingDns) {
-                alertText += ia.getHostAddress() + " ";
-            }
-            alertList.add(alertText);
-            return false;
-        }
-
-        return true;
-    }
-
-    /**
-     * This test tests connectivity to key servers in the untangle datacenter
-     */
-    private void testConnectivity(List<String> alertList)
-    {
-        Socket socket = null;
-
-        try {
-            socket = new Socket();
-            socket.connect(new InetSocketAddress("updates.untangle.com",80), 7000);
-        } catch ( Exception e ) {
-            alertList.add( i18nUtil.tr("Failed to connect to Untangle." +  " [updates.untangle.com:80]") );
-        } finally {
-            try {if (socket != null) socket.close();} catch (Exception e) {}
-        }
-
-        try {
-            socket = new Socket();
-            socket.connect(new InetSocketAddress("license.untangle.com",443), 7000);
-        } catch ( Exception e ) {
-            alertList.add( i18nUtil.tr("Failed to connect to Untangle." +  " [license.untangle.com:443]") );
-        } finally {
-            try {if (socket != null) socket.close();} catch (Exception e) {}
-        }
-    }
-
-    /**
-     * This test that pyconnector is connected to cmd.untangle.com
-     */
-    private void testConnector(List<String> alertList)
-    {
-        try {
-            if ( UvmContextFactory.context().isDevel() )
-                return;
-            if ( ! UvmContextFactory.context().systemManager().getSettings().getCloudEnabled() )
-                return;
-
-            File pidFile = new File("/var/run/ut-pyconnector.pid");
-            if ( !pidFile.exists() ) {
-                alertList.add( i18nUtil.tr("Failed to connect to Untangle." +  " [cmd.untangle.com]") );
-                return;
-            }
-
-            int result = this.execManager.execResult(System.getProperty("uvm.bin.dir") + "/ut-pyconnector-status");
-            if (result != 0)
-                alertList.add( i18nUtil.tr("Failed to connect to Untangle." +  " [cmd.untangle.com]") );
-        } catch (Exception e) {
-
-        }
-    }
-
-    /*
-     * This test that disk free % is less than 75%
-     */
-    private void testDiskFree(List<String> alertList)
-    {
-        String result = this.execManager.execOutput( "df -k / | awk '/\\//{printf(\"%d\",$5)}'");
-
-        try {
-            int percentUsed = Integer.parseInt(result);
-            if (percentUsed > 75)
-                alertList.add( i18nUtil.tr("Free Disk space is low.") +  " [ " + (100 - percentUsed) + i18nUtil.tr("% free ]") );
-        } catch (Exception e) {
-            logger.warn("Unable to determine free disk space",e);
-        }
-
-    }
-
-    /**
-     * Looks for somewhat comman errors in kern.log related to problematic disks
-     */
-    private void testDiskErrors(List<String> alertList)
-    {
-        ExecManagerResult result;
-
-        result = this.execManager.exec( "tail -n 15000 /var/log/kern.log | grep -m1 -B3 'DRDY ERR'" );
-        if ( result.getResult() == 0 ) {
-            alertList.add( i18nUtil.tr("Disk errors reported.") + "<br/>\n" + result.getOutput().replaceAll("\n","<br/>\n") );
-        }
-
-        result = this.execManager.exec( "tail -n 15000 /var/log/kern.log | grep -m1 -B3 'I/O error'" );
-        if ( result.getResult() == 0 ) {
-            alertList.add( i18nUtil.tr("Disk errors reported.") + "<br/>\n" + result.getOutput().replaceAll("\n","<br/>\n") );
-        }
-    }
-    
-    /**
-     * This test for multiple instances of the same application in a given rack
-     * This is never a good idea
-     */
-    private void testDupeApps(List<String> alertList)
-    {
-        LinkedList<NodeSettings> nodeSettingsList = UvmContextFactory.context().nodeManager().getSettings().getNodes();
-
-        /**
-         * Check each node for dupe nodes
-         */
-        for (NodeSettings n1 : nodeSettingsList ) {
-            for (NodeSettings n2 : nodeSettingsList ) {
-                if (n1.getId().equals(n2.getId()))
-                    continue;
-
-                /**
-                 * If they have the same name and are in the same rack - they are dupes
-                 * Check both for == and .equals so null is handled
-                 */
-                if (n1.getPolicyId() == null || n2.getPolicyId() == null) {
-                    if (n1.getPolicyId() == n2.getPolicyId() && n1.getNodeName().equals(n2.getNodeName()))
-                        alertList.add( i18nUtil.tr("Services contains two or more") + " " + n1.getNodeName() );
-                } else {
-                    if (n1.getPolicyId().equals(n2.getPolicyId()) && n1.getNodeName().equals(n2.getNodeName()))
-                        alertList.add(i18nUtil.tr("A policy/rack") + " [" + n1.getPolicyId() + "] " + i18nUtil.tr("contains two or more") + " " + n1.getNodeName());
-                }
-            }
-        }
-    }
-
-    /**
-     * This test iterates through each rack and test for redundant applications
-     * It creates an alert for each redundant pair
-     * Currently the redundant apps are:
-     * Web Filter and Web Filter Lite
-     * Spam Blocker and Spam Blocker Lite
-     * Web Filter and Web Monitor
-     */
-    private void testRendundantApps(List<String> alertList)
+    public void setSettings( final AlertSettings newSettings )
     {
         /**
-         * Check for redundant apps
+         * Set the Alert Rules IDs
          */
-        List<Node> webFilterLiteList = UvmContextFactory.context().nodeManager().nodeInstances("untangle-node-web-filter-lite");
-        List<Node> webFilterList = UvmContextFactory.context().nodeManager().nodeInstances("untangle-node-web-filter");
-        List<Node> spamBlockerLiteList = UvmContextFactory.context().nodeManager().nodeInstances("untangle-node-spam-blocker-lite");
-        List<Node> spamblockerList = UvmContextFactory.context().nodeManager().nodeInstances("untangle-node-spamblocker");
-        List<Node> webMonitorList = UvmContextFactory.context().nodeManager().nodeInstances("untangle-node-web-monitor");
-
-        for (Node node1 : webFilterLiteList) {
-            for (Node node2 : webFilterList) {
-                if (node1.getNodeSettings().getId().equals(node2.getNodeSettings().getId()))
-                    continue;
-
-                if (node1.getNodeSettings().getPolicyId().equals(node2.getNodeSettings().getPolicyId()))
-                    alertList.add(i18nUtil.tr("One or more racks contain redundant apps") + ": " + " Web Filter " + i18nUtil.tr("and") + " Web Filter Lite" );
-            }
+        int idx = 0;
+        for (AlertRule rule : newSettings.getAlertRules()) {
+            rule.setRuleId(++idx);
         }
 
-        for (Node node1 : webMonitorList) {
-            for (Node node2 : webFilterList) {
-                if (node1.getNodeSettings().getId().equals(node2.getNodeSettings().getId()))
-                    continue;
-
-                if (node1.getNodeSettings().getPolicyId().equals(node2.getNodeSettings().getPolicyId()))
-                    alertList.add(i18nUtil.tr("One or more racks contain redundant apps") + ": " + " Web Filter " + i18nUtil.tr("and") + " Web Monitor" );
-            }
+        AlertSettings convertedSettings = null;
+        if(newSettings.getVersion() < this.currentSettingsVersion){
+            logger.warn("AlertManagerImpl: do conversion");
+            convertedSettings = convertSettings(newSettings);
         }
 
-        for (Node node1 : spamBlockerLiteList) {
-            for (Node node2 : spamblockerList) {
-                if (node1.getNodeSettings().getId().equals(node2.getNodeSettings().getId()))
-                    continue;
-
-                if (node1.getNodeSettings().getPolicyId().equals(node2.getNodeSettings().getPolicyId()))
-                    alertList.add(i18nUtil.tr("One or more racks contain redundant apps") + ": " + " Spam Blocker " + i18nUtil.tr("and") + " Spam Blocker Lite" );
+        /**
+         * Save the settings
+         */
+        SettingsManager settingsManager = UvmContextFactory.context().settingsManager();
+        try {
+            if(convertedSettings != null){
+                settingsManager.save( this.settingsFilename, convertedSettings );
+            }else{
+                settingsManager.save( this.settingsFilename, newSettings );
             }
+        } catch (SettingsManager.SettingsException e) {
+            logger.warn("Failed to save settings.",e);
+            return;
         }
+
+        /**
+         * Change current settings
+         */
+        this.settings = newSettings;
+        try {logger.debug("New Settings: \n" + new org.json.JSONObject(this.settings).toString(2));} catch (Exception e) {}
+
+    }
+
+    private AlertSettings convertSettings(AlertSettings settings)
+    {
+        /**
+         * 12.0 conversion
+         */
+        if ( settings.getVersion() == null ) {
+            logger.warn("Running v12.0 conversion...");
+            settings = conversion_12_0(settings);
+        }
+        /**
+         * 12.1.1 conversion
+         */
+        if ( settings.getVersion() == 2 ) {
+            logger.warn("Running v12.1.1 conversion...");
+            settings = conversion_12_1_1(settings);
+        }
+
+        return settings;
     }
 
     /**
-     * This test iterates through each bridged interface and tests that the bridge its in is not
-     * "plugged in backwards"
-     * It does this by checking the location of the bridge's gateway
+     * Get the network settings
      */
-    private void testBridgeBackwards(List<String> alertList)
+    public AlertSettings getSettings()
     {
-        for ( InterfaceSettings intf : UvmContextFactory.context().networkManager().getEnabledInterfaces() ) {
-            if (!InterfaceSettings.ConfigType.BRIDGED.equals( intf.getConfigType() ))
-                continue;
+        return this.settings;
+    }
 
-            logger.debug("testBridgeBackwards: Checking Bridge: " + intf.getSystemDev());
-            logger.debug("testBridgeBackwards: Checking Bridge bridgedTo: " + intf.getBridgedTo());
+    private AlertSettings defaultSettings()
+    {
+        AlertSettings settings = new AlertSettings();
+        settings.setVersion( 1 );
+        settings.setAlertRules( defaultAlertRules() );
 
-            InterfaceSettings master = UvmContextFactory.context().networkManager().findInterfaceId(intf.getBridgedTo());
-            if (master == null) {
-                logger.warn("Unable to locate bridge master: " + intf.getBridgedTo());
-                continue;
-            }
+        return settings;
+    }
 
-            logger.debug("testBridgeBackwards: Checking Bridge master: " + master.getSystemDev());
-            if (master.getSystemDev() == null) {
-                logger.warn("Unable to locate bridge master systemName: " + master.getName());
-                continue;
-            }
-            String bridgeName = master.getSymbolicDev();
+    private LinkedList<AlertRule> defaultAlertRules()
+    {
+        LinkedList<AlertRule> rules = new LinkedList<AlertRule>();
 
-            String result = this.execManager.execOutput( "brctl showstp " + bridgeName + " | grep '^eth.*' | sed -e 's/(//g' -e 's/)//g'");
-            if (result == null || "".equals(result)) {
-                logger.warn("Unable to build bridge map");
-                continue;
-            }
-            logger.debug("testBridgeBackwards: brctlOutput: " + result);
+        LinkedList<AlertRuleCondition> matchers;
+        AlertRuleCondition matcher1;
+        AlertRuleCondition matcher2;
+        AlertRuleCondition matcher3;
+        AlertRule alertRule;
 
-            /**
-             * Parse output brctl showstp output. Example:
-             * eth0 2
-             * eth1 1
-             */
-            Map<Integer,String> bridgeIdToSystemNameMap = new HashMap<Integer,String>();
-            for (String line : result.split("\n")) {
-                logger.debug("testBridgeBackwards: line: " + line);
-                String[] subline = line.split(" ");
-                if (subline.length < 2) {
-                    logger.warn("Invalid brctl showstp line: \"" + line + "\"");
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*WanFailoverEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "action", "=", "DISCONNECTED" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( true, matchers, true, true, "WAN is offline", false, 0 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*SystemStatEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "load1", ">", "20" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( true, matchers, true, true, "Server load is high", true, 60 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*SystemStatEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "diskFreePercent", "<", ".2" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( true, matchers, true, true, "Free disk space is low", true, 60 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*SystemStatEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "memFreePercent", "<", ".05" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( false, matchers, true, true, "Free memory is low", true, 60 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*SystemStatEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "swapUsedPercent", ">", ".25" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( true, matchers, true, true, "Swap usage is high", true, 60 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*SessionEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "SServerPort", "=", "22" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( true, matchers, true, true, "Suspicious Activity: Client created many SSH sessions", true, 60, Boolean.TRUE, 20.0D, 60, "CClientAddr");
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*SessionEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "SServerPort", "=", "3389" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( true, matchers, true, true, "Suspicious Activity: Client created many RDP sessions", true, 60, Boolean.TRUE, 20.0D, 60, "CClientAddr");
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*SessionEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "entitled", "=", "false" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( true, matchers, true, true, "License limit exceeded. Session not entitled", true, 60*24 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*WebFilterEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "blocked", "=", "False" ) );
+        matchers.add( matcher2 );
+        matcher3 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "category", "=", "Malware Distribution Point" ) );
+        matchers.add( matcher3 );
+        alertRule = new AlertRule( true, matchers, true, true, "Malware Distribution Point website visit detected", false, 10 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*WebFilterEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "blocked", "=", "True" ) );
+        matchers.add( matcher2 );
+        matcher3 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "category", "=", "Malware Distribution Point" ) );
+        matchers.add( matcher3 );
+        alertRule = new AlertRule( true, matchers, true, true, "Malware Distribution Point website visit blocked", false, 10 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*WebFilterEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "blocked", "=", "False" ) );
+        matchers.add( matcher2 );
+        matcher3 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "category", "=", "Botnet" ) );
+        matchers.add( matcher3 );
+        alertRule = new AlertRule( true, matchers, true, true, "Botnet website visit detected", false, 10 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*WebFilterEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "blocked", "=", "True" ) );
+        matchers.add( matcher2 );
+        matcher3 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "category", "=", "Botnet" ) );
+        matchers.add( matcher3 );
+        alertRule = new AlertRule( true, matchers, true, true, "Botnet website visit blocked", false, 10 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*WebFilterEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "blocked", "=", "False" ) );
+        matchers.add( matcher2 );
+        matcher3 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "category", "=", "Phishing/Fraud" ) );
+        matchers.add( matcher3 );
+        alertRule = new AlertRule( true, matchers, true, true, "Phishing/Fraud website visit detected", false, 10 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*WebFilterEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "blocked", "=", "True" ) );
+        matchers.add( matcher2 );
+        matcher3 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "category", "=", "Phishing/Fraud" ) );
+        matchers.add( matcher3 );
+        alertRule = new AlertRule( true, matchers, true, true, "Phishing/Fraud website visit blocked", false, 10 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*DeviceTableEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "key", "=", "add" ) );
+        matchers.add( matcher2 );
+        if ( "i386".equals(System.getProperty("os.arch", "unknown")) || "amd64".equals(System.getProperty("os.arch", "unknown"))) {
+            alertRule = new AlertRule( false, matchers, true, true, "New device discovered", false, 0 );
+        } else {
+            alertRule = new AlertRule( true, matchers, true, true, "New device discovered", false, 0 );
+        }
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*QuotaEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "action", "=", "2" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( false, matchers, true, true, "Host exceeded quota.", false, 0 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*PenaltyBoxEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "action", "=", "1" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( false, matchers, true, true, "Host put in penalty box", false, 0 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*ApplicationControlLogEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "protochain", "=", "*BITTORRE*" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( false, matchers, true, true, "Host is using Bittorrent", true, 60 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*HttpResponseEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "contentLength", ">", "1000000000" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( false, matchers, true, true, "Host is doing large download", true, 60 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*CaptureUserEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "event", "=", "FAILED" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( false, matchers, true, true, "Failed Captive Portal login", false, 0 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*VirusHttpEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "clean", "=", "False" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( false, matchers, true, true, "HTTP virus blocked", false, 0 );
+        rules.add( alertRule );
+
+        return rules;
+    }
+
+    private AlertSettings conversion_12_0(AlertSettings settings)
+    {
+        settings.setVersion( 1 );
+
+        LinkedList<AlertRuleCondition> matchers;
+        AlertRuleCondition matcher1;
+        AlertRuleCondition matcher2;
+        AlertRule alertRule;
+
+        LinkedList<AlertRule> rules = settings.getAlertRules();
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*SessionEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "entitled", "=", "false" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( true, matchers, true, true, "License exceeded. Session not entitled", true, 60*24 );
+        rules.add( alertRule );
+
+        matchers = new LinkedList<AlertRuleCondition>();
+        matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*DeviceTableEvent*" ) );
+        matchers.add( matcher1 );
+        matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "key", "=", "add" ) );
+        matchers.add( matcher2 );
+        alertRule = new AlertRule( false, matchers, true, true, "New device discovered", false, 0 );
+        rules.add( alertRule );
+
+        return settings;
+    }
+
+    private AlertSettings conversion_12_1_1(AlertSettings settings)
+    {
+        settings.setVersion( 3 );
+
+        try {
+            boolean found = false;
+
+            for (Iterator<AlertRule> it = settings.getAlertRules().iterator(); it.hasNext() ;) {
+                AlertRule rule = it.next();
+                if ("Free Memory is low".equals( rule.getDescription() ) ) {
+                    logger.info("Replacing Free Memory alert rule...");
+                    it.remove();
+                    found = true;
                     break;
                 }
-                Integer key;
-                try {
-                    key = Integer.parseInt(subline[1]);
-                } catch (Exception e) {
-                    logger.warn("Invalid output: " + subline[1]);
-                    continue;
-                }
-                String systemName = subline[0];
-                logger.debug("testBridgeBackwards: Map: " + key + " -> " + systemName);
-                bridgeIdToSystemNameMap.put(key, systemName);
             }
 
-            /**
-             * This test is only valid for interfaces bridged to WANs.
-             * Non-WANs don't have a gateway so there is no "backwards"
-             */
-            if ( ! master.getIsWan() )
-                return;
+            if ( found ) {
+                LinkedList<AlertRuleCondition> matchers;
+                AlertRuleCondition matcher1;
+                AlertRuleCondition matcher2;
+                AlertRule alertRule;
 
-            InetAddress gateway   = UvmContextFactory.context().networkManager().getInterfaceStatus( master.getInterfaceId() ).getV4Gateway();
-            if (gateway == null) {
-                logger.warn("Missing gateway on bridge master: " + master.getInterfaceId());
-                return;
-            }
+                matchers = new LinkedList<AlertRuleCondition>();
+                matcher1 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "class", "=", "*SystemStatEvent*" ) );
+                matchers.add( matcher1 );
+                matcher2 = new AlertRuleCondition( AlertRuleCondition.ConditionType.FIELD_CONDITION, new AlertRuleConditionField( "memFreePercent", "<", ".05" ) );
+                matchers.add( matcher2 );
+                alertRule = new AlertRule( false, matchers, true, true, "Free memory is low", true, 60 );
 
-            /**
-             * Lookup gateway MAC using arp -a
-             */
-            String gatewayMac = this.execManager.execOutput( "arp -a " + gateway.getHostAddress() + " | awk '{print $4}' ");
-            if ( gatewayMac == null ) {
-                logger.warn("Unable to determine MAC for " + gateway.getHostAddress());
-                return;
+                LinkedList<AlertRule> rules = settings.getAlertRules();
+                rules.add( 3, alertRule );
             }
-            gatewayMac = gatewayMac.replaceAll("\\s+","");
-            if ( "".equals(gatewayMac) || "entries".equals(gatewayMac)) {
-                logger.warn("Unable to determine MAC for " + gateway.getHostAddress());
-                return;
-            }
-
-            /**
-             * Lookup gateway bridge port # using brctl showmacs
-             */
-            String portNo = this.execManager.execOutput( "brctl showmacs " + bridgeName + " | awk '/" + gatewayMac + "/ {print $1}'");
-            if ( portNo == null) {
-                logger.warn("Unable to find port number for MAC: " + gatewayMac);
-                return;
-            }
-            portNo = portNo.replaceAll("\\s+","");
-            if ( "".equals(portNo) ) {
-                logger.warn("Unable to find port number for MAC: " + gatewayMac);
-                return;
-            }
-            logger.debug("testBridgeBackwards: brctl showmacs Output: " + portNo);
-            Integer gatewayPortNo = Integer.parseInt(portNo);
-            logger.debug("testBridgeBackwards: Gateway Port: " + gatewayPortNo);
-
-
-            /**
-             * Lookup the system name for the bridge port
-             */
-            String gatewayInterfaceSystemName = bridgeIdToSystemNameMap.get(gatewayPortNo);
-            logger.debug("testBridgeBackwards: Gateway Interface: " + gatewayInterfaceSystemName);
-            if (gatewayInterfaceSystemName == null)  {
-                logger.warn("Unable to find bridge port " + gatewayPortNo);
-                return;
-            }
-
-            /**
-             * Get the interface configuration for the interface where the gateway lives
-             */
-            InterfaceSettings gatewayIntf = UvmContextFactory.context().networkManager().findInterfaceSystemDev(gatewayInterfaceSystemName);
-            if (gatewayIntf == null) {
-                logger.warn("Unable to find gatewayIntf " + gatewayInterfaceSystemName);
-                return;
-            }
-            logger.debug("testBridgeBackwards: Final Gateway Inteface: " + gatewayIntf.getName() + " is WAN: " + gatewayIntf.getIsWan());
-
-            /**
-             * Ideally, this is the WAN, however if its actually an interface bridged to a WAN, then the interfaces are probably backwards
-             */
-            if (!gatewayIntf.getIsWan()) {
-                String alertText = i18nUtil.tr("Bridge");
-                alertText += " (";
-                alertText += master.getName();
-                alertText += " <-> ";
-                alertText += intf.getName();
-                alertText += ") ";
-                alertText += i18nUtil.tr("may be backwards.");
-                alertText += " ";
-                alertText += i18nUtil.tr("Gateway");
-                alertText += " (";
-                alertText += gateway.getHostAddress();
-                alertText += ") ";
-                alertText += i18nUtil.tr("is on") + " ";
-                alertText += " ";
-                alertText += gatewayIntf.getName();
-                alertText += ".";
-
-                alertList.add(alertText);
-            }
+        } catch (Exception e) {
+            logger.warn("Conversion Exception",e);
         }
+
+        return settings;
+    }
+
+    public void logEvent( LogEvent event )
+    {
+        eventWriter.inputQueue.offer(event);
     }
 
     /**
-     * This test iterates through each interface and tests for
-     * TX and RX errors on each interface.
-     * It creates alert if there are a "high number" of errors
+     * This thread periodically walks through the entries and removes expired entries
+     * It also explicitly releases hosts from the penalty box and quotas after expiration
      */
-    private void testInterfaceErrors(List<String> alertList)
+
+    /**
+      * The amount of time for the event write to sleep
+       * if there is not a lot of work to be done
+    */
+    private static int SYNC_TIME = 30*1000; /* 30 seconds */
+
+    /**
+     * If the event queue length reaches the high water mark
+     * Then the eventWriter is not able to keep up with demand
+     * In this case the overloadedFlag is set to true
+     */
+    private static int HIGH_WATER_MARK = 1000000;
+
+    /**
+     * If overloadedFlag is set to true and the queue shrinks to this size
+     * then overloadedFlag will be set to false
+     */
+    private static int LOW_WATER_MARK = 100000;
+
+    private static boolean forceFlush = false;
+
+    private class AlertEventWriter implements Runnable
     {
-        for ( InterfaceSettings intf : UvmContextFactory.context().networkManager().getEnabledInterfaces() ) {
-            if ( intf.getSystemDev() == null )
-                continue;
 
-            String lines = this.execManager.execOutput( "ifconfig " + intf.getPhysicalDev() + " | awk '/errors/ {print $3}'");
-            String type = "RX";  //first line is RX erros
+        private volatile Thread thread;
 
-            for (String line : lines.split("\n")) {
-                line = line.replaceAll("\\s+","");
-                logger.debug("testInterfaceErrors line: " + line);
+        /**
+         * Maximum number of events to write per work cycle
+         */
+        private int maxEventsPerCycle = 20000; 
 
-                String[] errorsLine = line.split(":");
-                if (errorsLine.length < 2)
-                    continue;
+        /**
+         * If true then the eventWriter is considered "overloaded" and can not keep up with demand
+         * This is set if the event queue length reaches the high water mark
+         * In this case we stop logging events entirely until we are no longer overloaded
+         */
+        private boolean overloadedFlag = false;
+    
+        /**
+         * This stores the maximum queue delay for the last batch
+         * That is difference between now() and the oldest event in the batch
+         * This approximates the delay its taking for events to be written to the database
+         * If the event writer falls behind this value can get large.
+         * Typical values less than a minute. A value of one hour would mean its behind and writing events slower than they are being created
+         * and that it is currently taking one hour before new events are written to the database
+         */
+        private long writeDelaySec = 0;
 
-                String errorsCountStr = errorsLine[1];
-                Integer errorsCount;
-                try { errorsCount = Integer.parseInt(errorsCountStr); } catch (NumberFormatException e) { continue; }
+        /**
+         * This is a queue of incoming events
+         */
+        private final BlockingQueue<LogEvent> inputQueue = new LinkedBlockingQueue<LogEvent>();
 
+        public void run()
+        {
+            thread = Thread.currentThread();
+
+            LinkedList<LogEvent> logQueue = new LinkedList<LogEvent>();
+            LogEvent event = null;
+
+            /**
+             * Loop indefinitely and continue logging events
+             */
+            while (thread != null) {
                 /**
-                 * Check for an arbitrarily high number of errors
-                 * errors sometimes happen in small numbers and should be ignored
+                 * Sleep until next log time
+                 * If force flush was called, don't sleep
+                 * If there is already a full runs worth of events, don't sleep
+                 * If events are significantly delayed (more than 2x SYNC_TIME), don't sleep
                  */
-                if (errorsCount > 2500) {
-                    String alertText = "";
-                    alertText += intf.getName();
-                    alertText += " ";
-                    alertText += i18nUtil.tr("interface NIC card has a high number of");
-                    alertText += " " + type + " ";
-                    alertText += i18nUtil.tr("errors");
-                    alertText += " (";
-                    alertText += errorsCountStr;
-                    alertText += ")";
-                    alertText += ".";
-
-                    alertList.add(alertText);
+                if ( forceFlush ||
+                     (inputQueue.size() > maxEventsPerCycle) ||
+                    (writeDelaySec*1000 >  SYNC_TIME*2) ) {
+                    logger.debug("persist(): skipping sleep");
+                    // minor sleep to let other threads that my want to synchronize on this run
+                    try {Thread.sleep(100);} catch (Exception e) {}
+                } else {
+                    try {Thread.sleep(SYNC_TIME);} catch (Exception e) {}
                 }
 
-                type = "TX"; // second line is TX
-            }
-
-        }
-    }
-
-    /**
-     * This test tests to make sure public DNS servers are not used if spam blocking applications are installed
-     */
-    private void testSpamDNSServers(List<String> alertList)
-    {
-        List<Node> spamBlockerLiteList = UvmContextFactory.context().nodeManager().nodeInstances("untangle-node-spam-blocker-lite");
-        List<Node> spamblockerList = UvmContextFactory.context().nodeManager().nodeInstances("untangle-node-spamblocker");
-        String nodeName = "Spam Blocker";
-
-        if (spamBlockerLiteList.size() == 0 && spamblockerList.size() == 0)
-            return;
-        if (spamBlockerLiteList.size() > 0)
-            nodeName = "Spam Blocker Lite";
-        if (spamblockerList.size() > 0)
-            nodeName = "Spam Blocker";
-
-        for ( InterfaceSettings intf : UvmContextFactory.context().networkManager().getEnabledInterfaces() ) {
-            if (!intf.getIsWan())
-                continue;
-
-            InetAddress dnsPrimary   = UvmContextFactory.context().networkManager().getInterfaceStatus( intf.getInterfaceId() ).getV4Dns1();
-            InetAddress dnsSecondary = UvmContextFactory.context().networkManager().getInterfaceStatus( intf.getInterfaceId() ).getV4Dns2();
-
-            List<String> dnsServers = new LinkedList<String>();
-            if ( dnsPrimary != null ) dnsServers.add(dnsPrimary.getHostAddress());
-            if ( dnsSecondary != null ) dnsServers.add(dnsSecondary.getHostAddress());
-
-            for (String dnsServer : dnsServers) {
-                /* hardcode common known bad DNS */
-                if ( "8.8.8.8".equals( dnsServer ) || /* google */
-                     "8.8.4.4".equals( dnsServer ) || /* google */
-                     "4.2.2.1".equals( dnsServer ) || /* level3 */
-                     "4.2.2.2".equals( dnsServer ) || /* level3 */
-                     "208.67.222.222".equals( dnsServer ) || /* openDNS */
-                     "208.67.222.220".equals( dnsServer ) /* openDNS */ ) {
-                    String alertText = "";
-                    alertText += nodeName + " " + i18nUtil.tr("is installed but an unsupported DNS server is used");
-                    alertText += " (";
-                    alertText += intf.getName();
-                    alertText += ", ";
-                    alertText += dnsServer;
-                    alertText += ").";
-
-                    alertList.add(alertText);
-                }
-                /* otherwise check each DNS against spamhaus */
-                else {
-                    Lookup lookup;
-                    Record[] records = null;
-                    InetAddress expectedResult;
-
+                synchronized( this ) {
                     try {
-                        lookup = new Lookup("2.0.0.127.zen.spamhaus.org");
-                        expectedResult = InetAddress.getByName("127.0.0.4");
-                    } catch ( Exception e ) {
-                        logger.warn( "Invalid Lookup", e );
-                        continue;
-                    }
-                    try {
-                        lookup.setResolver( new SimpleResolver( dnsServer ) );
-                        records = lookup.run();
+                        /**
+                         * Copy all events out of the queue
+                        */
+                        while ((event = inputQueue.poll()) != null && logQueue.size() < maxEventsPerCycle) {
+                            logQueue.add(event);
+                        }
+
+                        /**
+                         * Check queue lengths
+                         */
+                        if (!this.overloadedFlag && inputQueue.size() > HIGH_WATER_MARK)  {
+                            logger.warn("OVERLOAD: High Water Mark reached.");
+                            this.overloadedFlag = true;
+                        }
+                        if (this.overloadedFlag && inputQueue.size() < LOW_WATER_MARK) {
+                            logger.warn("OVERLOAD: Low Water Mark reached. Continuing normal operation.");
+                            this.overloadedFlag = false;
+                        }
+
+                        /**
+                         * Run alert rules
+                         */
+                        for ( LogEvent le : logQueue ) {
+                            // runAlertRules( alertRules, event, reports );
+                        }
+                    
+                        try {Thread.sleep(1000);} catch (Exception e) {}
+
                     } catch (Exception e) {
-                        logger.warn("Invalid Resolver: " + dnsServer );
-                    }
-
-                    if ( records == null ) {
-                        records = new Record[0];
-                    }
-
-                    boolean found = false;
-
-                    found = false;
-                    for (Record r : records) {
-                        if (r instanceof ARecord) {
-                            InetAddress addr = ((ARecord)r).getAddress();
-                            if ( addr != null && addr.equals( expectedResult ) )
-                                found = true;
-                        }
-                    }
-
-                    if ( !found ) {
-                        String alertText = "";
-                        alertText += nodeName + " " + i18nUtil.tr("is installed but a DNS server");
-                        alertText += " (";
-                        alertText += intf.getName();
-                        alertText += ", ";
-                        alertText += dnsServer + ") ";
-                        alertText += i18nUtil.tr("fails to resolve DNSBL queries.");
-
-                        alertList.add(alertText);
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Tests that zvelo queries can be resolved correctly
-     */
-    @SuppressWarnings("rawtypes")
-    private void testZveloDNSServers(List<String> alertList)
-    {
-        List<Node> webFilterList = UvmContextFactory.context().nodeManager().nodeInstances("untangle-node-web-filter");
-
-        if ( webFilterList.size() == 0 )
-            return;
-
-        String query = null;
-        try {
-            Method method;
-            Node webFilter = webFilterList.get(0);
-
-            Class[] args = { String.class, String.class };
-            method = webFilter.getClass().getMethod( "encodeDnsQuery", args );
-            query = (String) method.invoke( webFilter, "cnn.com", "/" );
-        } catch (Exception e) {
-            logger.warn("Exception generating Web Filter DNS query: ",e);
-            return;
-        }
-
-        if ( query == null ) {
-            logger.warn("Invalid zvelo query: " + query);
-            return;
-        }
-
-        for ( InterfaceSettings intf : UvmContextFactory.context().networkManager().getEnabledInterfaces() ) {
-            if (!intf.getIsWan())
-                continue;
-
-            InetAddress dnsPrimary   = UvmContextFactory.context().networkManager().getInterfaceStatus( intf.getInterfaceId() ).getV4Dns1();
-            InetAddress dnsSecondary = UvmContextFactory.context().networkManager().getInterfaceStatus( intf.getInterfaceId() ).getV4Dns2();
-
-            List<String> dnsServers = new LinkedList<String>();
-            if ( dnsPrimary != null ) dnsServers.add(dnsPrimary.getHostAddress());
-            if ( dnsSecondary != null ) dnsServers.add(dnsSecondary.getHostAddress());
-
-            for (String dnsServer : dnsServers) {
-
-                Lookup lookup;
-                Record[] records = null;
-
-                try {
-                    lookup = new Lookup( query, Type.TXT );
-                } catch ( Exception e ) {
-                    logger.warn( "Invalid Lookup", e );
-                    continue;
-                }
-                long t0 = System.currentTimeMillis();
-                try {
-                    lookup.setResolver( new SimpleResolver( dnsServer ) );
-                    records = lookup.run();
-                } catch (Exception e) {
-                    logger.warn("Invalid Resolver: " + dnsServer );
-                }
-                long t1 = System.currentTimeMillis();
-
-                if ( records == null ) {
-                    records = new Record[0];
-                }
-
-                boolean found = false;
-                for (Record r : records) {
-                    if (r instanceof TXTRecord) {
-                        for (Object o : ((TXTRecord)r).getStringsAsByteArrays()) {
-                            String resultStr = new String((byte[])o);
-                            //if there is a TXT response that includes cnn.com its probably correct
-                            if (resultStr.contains("cnn.com"))
-                                found = true;
+                        logger.warn("Failed to write alert events.", e);
+                    } finally {
+                        /**
+                         * If the forceFlush flag was set, reset it and wake any interested parties
+                         */
+                        if (forceFlush) {
+                            forceFlush = false; //reset global flag
+                            notifyAll();  /* notify any waiting threads that the flush is done */ 
                         }
                     }
                 }
+            }
+        }
 
-                if (!found) {
-                    String alertText = "";
-                    alertText += "Web Filter " + i18nUtil.tr("is installed but a DNS server");
-                    alertText += " (";
-                    alertText += intf.getName();
-                    alertText += ", ";
-                    alertText += dnsServer + ")";
-                    alertText += " " + i18nUtil.tr("fails to resolve categorization queries.");
+        protected void start()
+        {
+            UvmContextFactory.context().newThread(this).start();
+        }
 
-                    logger.warn("DNS Lookup failed [" + dnsServer + ",TXT]: " + query);
-                    alertList.add(alertText);
-                } else if ( t1-t0 > 500 ) {
-                    String alertText = "";
-                    alertText += i18nUtil.tr("A DNS server responds slowly.");
-                    alertText += " (";
-                    alertText += intf.getName();
-                    alertText += ", ";
-                    alertText += dnsServer;
-                    alertText += ", ";
-                    alertText += (t1-t0) + " ms";
-                    alertText += ") ";
-                    alertText += i18nUtil.tr("This may negatively effect Web Filter performance.");
+        protected void stop()
+        {
+            // this is disabled because it causes boxes to hang on stopping the uvm
+            // forceFlush(); /* flush last few events */
 
-                    alertList.add(alertText);
-                }
+            Thread tmp = thread;
+            thread = null; /* thread will exit if thread is null */
+            if (tmp != null) {
+                tmp.interrupt();
             }
         }
     }
-
-    /**
-     * This test that the event writing time on average is not "too" slow.
-     */
-    private void testEventWriteTime(List<String> alertList)
-    {
-        final double MAX_AVG_TIME_WARN = 50.0;
-
-        Reporting reports = (Reporting) UvmContextFactory.context().nodeManager().node("untangle-node-reports");
-        /* if reports not installed - no events - just return */
-        if (reports == null)
-            return;
-
-        double avgTime = reports.getAvgWriteTimePerEvent();
-        if (avgTime > MAX_AVG_TIME_WARN) {
-            String alertText = "";
-            alertText += i18nUtil.tr("Event processing is slow");
-            alertText += " (";
-            alertText += String.format("%.1f",avgTime) + " ms";
-            alertText += "). ";
-
-            alertList.add(alertText);
-        }
-    }
-
-    /**
-     * This test that the event writing delay is not too long
-     */
-    private void testEventWriteDelay(List<String> alertList)
-    {
-        final long MAX_TIME_DELAY_SEC = 600; /* 10 minutes */
-
-        Reporting reports = (Reporting) UvmContextFactory.context().nodeManager().node("untangle-node-reports");
-        /* if reports not installed - no events - just return */
-        if (reports == null)
-            return;
-
-        long delay = reports.getWriteDelaySec();
-        if (delay > MAX_TIME_DELAY_SEC) {
-            String alertText = "";
-            alertText += i18nUtil.tr("Event processing is behind");
-            alertText += " (";
-            alertText += String.format("%.1f",(((float)delay)/60.0)) + " minute delay";
-            alertText += "). ";
-
-            alertList.add(alertText);
-        }
-    }
-
-    /**
-     * This test tests for "nf_queue full" messages in kern.log
-     */
-    private void testQueueFullMessages(List<String> alertList)
-    {
-        int result = this.execManager.execResult("tail -n 20 /var/log/kern.log | grep -q 'nf_queue:.*dropping packets'");
-        if ( result == 0 ) {
-            String alertText = "";
-            alertText += i18nUtil.tr("Packet processing recently overloaded.");
-
-            alertList.add(alertText);
-        }
-    }
-
-    /**
-     * This test that the shield is enabled
-     */
-    private void testShieldEnabled( List<String> alertList )
-    {
-        Node shield = UvmContextFactory.context().nodeManager().node("untangle-node-shield");
-        String alertText = "";
-        alertText += i18nUtil.tr("The shield is disabled. This can cause performance and stability problems.");
-
-        if ( shield.getRunState() != NodeSettings.NodeState.RUNNING ) {
-            alertList.add(alertText);
-            return;
-        }
-
-        try {
-            java.lang.reflect.Method method;
-            method = shield.getClass().getMethod( "getSettings" );
-            Object settings = method.invoke( shield );
-            method = settings.getClass().getMethod( "isShieldEnabled" );
-            Boolean result = (Boolean) method.invoke( settings );
-            if (! result ) {
-                alertList.add(alertText);
-                return;
-            }
-        } catch (Exception e) {
-            logger.warn("Exception reading shield settings: ",e);
-        }
-    }
-
-    private void testRoutesToReachableAddresses( List<String> alertList )
-    {
-        int result;
-        List<StaticRoute> routes = UvmContextFactory.context().networkManager().getNetworkSettings().getStaticRoutes();
-
-        for ( StaticRoute route : routes ) {
-            if ( ! route.getToAddr() )
-                continue;
-
-            /**
-             * If already in the ARP table, continue
-             */
-            result = this.execManager.execResult("arp -n " + route.getNextHop() + " | grep -q HWaddress");
-            if ( result == 0 )
-                continue;
-
-            /**
-             * If not, force arp resolution with ping
-             * Then recheck ARP table
-             */
-            result = this.execManager.execResult("ping -c1 -W1 " + route.getNextHop());
-            result = this.execManager.execResult("arp -n " + route.getNextHop() + " | grep -q HWaddress");
-            if ( result == 0 )
-                continue;
-
-            String alertText = "";
-            alertText += i18nUtil.tr("Route to unreachable address:");
-            alertText += " ";
-            alertText += route.getNextHop();
-
-            alertList.add(alertText);
-        }
-
-    }
-
-    private void testServerConf( List<String> alertList )
-    {
-        try {
-            String arch = System.getProperty("sun.arch.data.model") ;
-
-            // only check 64-bit machines
-            if ( arch == null || ! "64".equals( arch ) )
-                return;
-
-            // check total memory, return if unable to check total memory
-            String result = this.execManager.execOutput( "awk '/MemTotal:/ {print $2}' /proc/meminfo" );
-            if ( result == null )
-                return;
-            result = result.trim();
-            if ( "".equals(result) )
-                return;
-
-            int memTotal = Integer.parseInt( result );
-            if ( memTotal < 1900000 ) {
-                String alertText = i18nUtil.tr("Running 64-bit with less than 2 gigabytes RAM is not suggested.");
-                alertList.add(alertText);
-            }
-        } catch (Exception e) {
-            logger.warn("Exception testing system: ",e);
-        }
-    }
-
-    private void testLicenseCompliance( List<String> alertList )
-    {
-        int currentSize = UvmContextFactory.context().hostTable().getCurrentActiveSize();
-        int seatLimit = UvmContextFactory.context().licenseManager().getSeatLimit( true );
-        int actualSeatLimit = UvmContextFactory.context().licenseManager().getSeatLimit( false );
-
-        if ( seatLimit > 0 && currentSize > seatLimit ) {
-            String alertText = i18nUtil.tr("Currently the number of devices significantly exceeds the number of licensed devices.") + " (" + currentSize + " > " + actualSeatLimit + ")";
-            alertList.add(alertText);
-        }
-     }
-        
 
 }
