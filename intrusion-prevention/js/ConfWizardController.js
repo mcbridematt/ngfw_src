@@ -40,7 +40,7 @@ Ext.define('Ung.apps.intrusionprevention.ConfWizardController', {
             var architecture = stats.systemStats["architecture"];
             if( architecture == "i386"){
                 architecture = "32";
-            } else if( architecture == "amd64") {
+            } else if( architecture == "amd64" || architecture == "arm64") {
                 architecture = "64";
             } else {
                 architecture = "unknown";
